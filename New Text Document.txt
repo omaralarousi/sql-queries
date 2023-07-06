@@ -1,0 +1,507 @@
+WITH orders AS (SELECT DISTINCT
+so_act.sales_orders_id,
+SO.RETAILER_ID,
+so_act.run_sheet_id,
+w.id warehouse_id,
+w.name AS warehouse,
+rs.delivery_date,
+sos.name_en AS status,
+SUM(CASE WHEN sos.name_en IN ('Delayed','Failed') THEN GREATEST(pso.issued_count, pso.purchased_item_count)*pso.item_price ELSE pso.issued_count*pso.item_price END) AS ofd,
+SUM(CASE WHEN sos.name_en = 'Delivered' THEN pso.purchased_item_count*pso.item_price END) AS nmv,
+MAX(so_act.created_at) AS updated_at,
+ROW_NUMBER()OVER(PARTITION BY so_act.sales_orders_id, so_act.run_sheet_id ORDER BY MAX(so_act.created_at)) AS row_num
+
+FROM public.sales_order_status_activities so_act
+
+LEFT JOIN public.run_sheets rs ON so_act.run_sheet_id = rs.id
+LEFT JOIN public.warehouses w ON rs.warehouse_id = w.id
+LEFT JOIN public.sales_order_statuses sos ON so_act.sales_order_statuses_id = sos.id
+LEFT JOIN public.product_sales_order pso ON so_act.sales_orders_id = pso.sales_order_id
+LEFT JOIN (SELECT  RETAILER_ID,ID FROM PUBLIC.SALES_ORDERS) SO ON SO.ID = SO_ACT.sales_orders_id
+
+WHERE  so_act.sales_order_statuses_id IN (6,7,8) AND so_act.run_sheet_id IS NOT NULL
+and w.id in (236,1,240,343,467,434,73,38,39,340,8,337,74,368,339,170)
+GROUP BY 1,2,3,4,5,6,7),
+
+o2 as (
+select *,
+CASE WHEN UPDATED_AT between UPDATED_AT::date and UPDATED_AT::date +interval '4 hour'
+then (UPDATED_AT::date - interval '1 day' )::date
+else UPDATED_AT::date end ::date as ACTION_date
+from orders 
+
+WHERE row_num = 1),
+
+CRD AS (
+SELECT *,
+case when c1.created_at::time between '10:30 AM' and '09:00 PM' and c1.created_at::date = c1.collection_date then 
+'same day' else 'overnight' end as order_time
+FROM
+(select 
+case when 
+coa.status_changed_at between coa.status_changed_at::date and coa.status_changed_at::date +interval '4 hour'
+then (coa.status_changed_at::date - interval '1 day' )::date
+else coa.status_changed_at::date end ::date as collection_date,
+case when co.type_id = 1 then 'Credit'
+     when co.type_id = 2 and ARRAY_CONTAINS('Default_order'::variant,ci.tag) then 'Default Order'
+     when co.type_id = 2 then 'Collection_order' end as type,
+coa.status_changed_at updated_at,
+co1.delayed_at + interval '2 hour' as delayed_at,
+CASE WHEN  ARRAY_CONTAINS('INSTANT'::variant,ci.cash_in_mode) THEN 'INSTANT' 
+WHEN NOT ARRAY_CONTAINS('INSTANT'::variant,ci.cash_in_mode) AND ci.cash_in_mode IS NOT NULL THEN  'DEFERRED' END AS CASHIN_MODE,
+coa.collection_order_id ops_id,
+CO.RETAILER_ID,
+opn.polygon_id zone,
+reg.id region_id,
+co.type_id,
+co1.loan_id,
+coa.run_sheet_id,
+rn.created_At as runsheet_created_at,
+co.created_at,
+co.initial_date::DATE AS initial_date ,
+CI2.collection_date_option,
+dr.id driver_id,
+split_part(dr.name,'-',1) courier,
+co.COLLECTION_AMOUNT AS initial_amount,
+CASE WHEN ss.name_en = 'DELAYED' THEN 0 ELSE co.COLLECTED_AMOUNT END AS COLLECTED_AMOUNT,
+mrp.polygon_name_en,
+ci.tag,
+ss.name_en status,
+LAST_COLLECTION_STATUS_d,
+LAST_COLLECTION_updated_d_rn,
+row_number()over(partition by co1.loan_id order by coa.status_changed_at asc range between unbounded preceding and unbounded following) loan_attempt,
+coa.attempt,
+coa.attempt_n_day,
+coa.attempts_day
+
+from 
+
+(select *,
+row_number() over(partition by collection_order_id order by status_changed_at range between unbounded PRECEDING and unbounded following) AS attempt,
+row_number() over(partition by collection_order_id,collection_date order by status_changed_at) attempt_n_day,
+count(*) over(partition by collection_order_id,collection_date order by status_changed_at range between unbounded PRECEDING and unbounded following) as attempts_day,
+FIRST_VALUE(CSS2.NAME_EN) OVER(PARTITION BY COLLECTION_ORDER_ID,COLLECTION_DATE ORDER BY status_changed_at DESC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED following) LAST_COLLECTION_STATUS_d,
+FIRST_VALUE(status_changed_at) OVER(PARTITION BY COLLECTION_ORDER_ID,run_sheet_id,COLLECTION_DATE ORDER BY status_changed_at DESC RANGE BETWEEN UNBOUNDED PRECEDING AND UNBOUNDED following) LAST_COLLECTION_updated_d_rn,
+ROW_NUMBER() OVER(partition BY collection_order_id,run_sheet_id,COLLECTION_DATE ORDER BY status_changed_at DESC) RW2
+from
+
+(select *,
+case when 
+status_changed_at between status_changed_at::date and status_changed_at::date +interval '4 hour'
+then (status_changed_at::date - interval '1 day' )::date
+else status_changed_at::date end ::date as collection_date,
+
+row_number() over(partition by collection_order_id,collection_order_status_id,status_changed_at::date order by status_changed_at)  as rw
+ 
+from public.collection_order_status_activities where collection_order_status_id  not in (1,7,8,10))coo
+LEFT JOIN PUBLIC.collection_order_statuses CSS2 ON CSS2.ID = COO.collection_order_status_id
+)coa
+
+left join public.collection_order_statuses ss on ss.id = coa.collection_order_status_id
+left join public.collection_orders co on co.id = coa.collection_order_id
+left join emoney.collection_orders co1 on co1.id = co.maxab_collection_order_id
+
+left join (SELECT collection_order_id,max(final_cash_in_date)final_cash_in_date, arrayagg(cash_in_mode) as cash_in_mode,arrayagg(tag_english)as tag FROM emoney.cash_ins 
+WHERE collection_order_id IS NOT NULL 
+and tag_english in('Cash-In request','Cash-In request tsales','Default_order','Cash-in Request')
+group by 1
+order by 1) ci on ci.collection_order_id = co1.id
+
+left join public.run_sheets rn on rn.id = coa.run_sheet_id
+left join public.drivers dr on dr.id = rn.driver_id
+left join emoney.retailers rs on rs.id = co1.retailer_id
+left join fintech.fintech_retailer_polygon mrp on mrp.retailer_id = rs.main_system_id
+left join fintech.ops_onground_groups opn on REPLACE(opn.polygon,' ','') = REPLACE(mrp.polygon_name_en,' ','')
+LEFT JOIN PUBLIC.DISTRICTS d ON mrp.district_id = d.id
+LEFT JOIN PUBLIC.CITIES cit ON d.city_id =cit.id
+LEFT JOIN PUBLIC.STATES STAT ON cit.state_id=stat.id
+LEFT JOIN PUBLIC.REGIONS reg ON reg.id=stat.region_id 
+left join (select distinct collection_order_id,collection_date_option from emoney.cash_ins)ci2 on ci2.collection_order_id = co.maxab_collection_order_id
+where co.type_id in (2) 
+and reg.id in (2,102,3)
+and co.retailer_id not in  {{snippet: maxab_emoney_users}}
+and (ci.tag is not null  or co.type_id = 1)
+and rw2 = 1
+)C1
+where type <> 'Default Order'
+--WHERE (TYPE = 'Collection_order' AND ATTEMPT = 1) OR (TYPE = 'Credit' AND loan_attempt = 1)
+),
+
+
+
+FINAL AS (
+SELECT *
+FROM
+(select *,
+-------------------------------------------filter data per day ----------------------------------------------------------------------
+ROW_NUMBER()OVER(PARTITION BY OPS_ID,COLLECTION_DATE ORDER BY COLLECTION_UPDATED_AT_FIRST_ACTION ASC, ECOMMERCE_UPDATED DESC) RR1
+-- ROW_NUMBER()OVER(PARTITION BY OPS_ID,COLLECTION_DATE ORDER BY ASSIGNED_ORDER DESC) RR1
+--------------------------------------------------------------------------------------------------------------------------------------
+
+from
+(SELECT RETAILER_ID,REGION_ID,sales_orders_id,sales_rn,warehouse,delivery_date,updated_at,OFD,NMV,SALES_ORDER_STATUS,COLLECTION_DATE,OPS_ID,TYPE,zone,CASHIN_MODE,created_at,
+initial_date,collection_date_option,initial_amount,COLLECTED_AMOUNT,COLLECTION_UPDATED_AT_FIRST_ACTION,ECOM_RUNSHEET,ECOMMERCE_STATUS,ECOMMERCE_UPDATED,LAST_STATUS,order_time,ASSIGNED_ORDER,RC,
+CASE WHEN ASSIGNED_ORDER = 'NO' THEN VALIDATION END AS VALIDATION,
+VALIDATION_ASSIGN,
+case when COLLECTION_DATE_OPTION = 'BEFORE_IFTAR'  and type = 'Collection_order' and ASSIGNED_ORDER = 'YES' AND extract(hour from ecommerce_updated) between 10 and 17 then 'YES'
+     when  ASSIGNED_ORDER = 'YES' and type = 'Credit'  then 'YES'
+     when COLLECTION_DATE_OPTION = 'AFTER_IFTAR'  and type = 'Collection_order' and ASSIGNED_ORDER = 'YES' and extract(hour from ecommerce_updated) between 18 and 23 then 'YES'
+     ELSE 'NO'
+     end as sla1
+-- row_number() over(partition by OPS_ID,collection_date,ASSIGNED_ORDER order by COLLECTION_UPDATED_AT DESC) rn_assigned,
+-- row_number() over(partition by OPS_ID,run_sheet_id,collection_date,ASSIGNED_ORDER order by COLLECTION_UPDATED_AT DESC) rn_assigned2
+
+FROM
+(SELECT CRD.RETAILER_ID,CRD.region_id,crd.zone,O2.sales_orders_id,o2.run_sheet_id as sales_rn,O2.warehouse,O2.delivery_date,O2.updated_at,O2.OFD,O2.NMV, 
+O2.STATUS AS SALES_ORDER_STATUS,
+CRD.COLLECTION_DATE,CRD.OPS_ID,CRD.TYPE,CRD.CASHIN_MODE,CRD.created_at,CRD.initial_date,CRD.collection_date_option,CRD.initial_amount,
+case when CH.STATUS not in ('COLLECTED','PARTIALLY_COLLECTED') OR CH.STATUS IS NULL THEN 0 ELSE  CRD.COLLECTED_AMOUNT END COLLECTED_AMOUNT ,
+CRD.LAST_COLLECTION_STATUS_d AS LAST_STATUS,
+CRD.updated_at AS COLLECTION_UPDATED_AT_FIRST_ACTION,
+CRD.order_time,
+CRD.run_sheet_id,
+CH.run_sheet_id ECOM_RUNSHEET,
+CH.STATUS ECOMMERCE_STATUS,
+ch.status_changed_at as ecommerce_updated,
+row_number() over(partition by crd.OPS_ID,crd.COLLECTION_DATE order by CRD.updated_at,o2.ofd DESC) as rc ,
+row_number() over(partition by o2.sales_orders_id,crd.COLLECTION_DATE order by delivery_date) rs,
+CASE WHEN CH.run_sheet_id IS NOT NULL THEN 'YES' ELSE 'NO' END AS ASSIGNED_ORDER,
+
+case when crd.created_at + interval '30 minute' >= o2.updated_at then 'VALID'
+     when crd.created_at + interval '30 minute' < o2.updated_at  then  'NOT VALID' END AS VALIDATION,
+CASE WHEN crd.created_at > o2.updated_at THEN 'NOT VALID' ELSE 'VALID' END VALIDATION_ASSIGN
+
+FROM CRD
+JOIN O2 ON O2.RETAILER_ID = CRD.RETAILER_ID AND CRD.COLLECTION_DATE = O2.ACTION_DATE 
+LEFT JOIN ( 
+            select coa.*
+            from
+              (select statuses1.*,
+               case 
+                 when statuses1.collection_order_status_id = 2 or editor_id = 119 or (statuses1.collection_order_status_id = 3 and statuses1.COLLECTION_ORDER_SUB_STATUS_ID is null and statuses1.EDITOR_TYPE = 'admin') 
+                 or (statuses1.collection_order_status_id = 3 and statuses1.COLLECTION_ORDER_SUB_STATUS_ID = 3 and  statuses1.delayed_to is null ) then 'ASSIGNED'
+                 when statuses1.collection_order_status_id = 3 and statuses1.COLLECTION_ORDER_SUB_STATUS_ID is null and statuses1.EDITOR_TYPE = 'agent' and delayed_to is null then 'TRIP STARTED'
+                 WHEN statuses1.collection_order_status_id = 3 and statuses1.COLLECTION_ORDER_SUB_STATUS_ID = 1 and delayed_to is null THEN 'TASK STARTED'
+                 WHEN statuses1.collection_order_status_id = 3 and statuses1.run_sheet_id = statuses1.run_sheet_id and statuses1.COLLECTION_ORDER_SUB_STATUS_ID = 2 THEN 'ARRIVED'
+                 when statuses1.collection_order_status_id = 3 and statuses1.delayed_to = 'same day' then 'DELAYED SAME DAY'
+                 ELSE co_s.name_en END status
+                   from
+     
+                     (select *,
+                      case when 
+                           status_changed_at between status_changed_at::date and status_changed_at::date +interval '4 hour'
+                           then (status_changed_at::date - interval '1 day' )::date
+                           else status_changed_at::date end ::date as collection_date1 ,
+                        row_number()over(partition by collection_order_id,run_sheet_id order by status_changed_at desc) rw
+                          from COLLECTION_ORDER_STATUS_ACTIVITIES co_sa
+                          where collection_order_status_id not in (1,7,8,10) 
+                      )statuses1
+                    left join collection_order_statuses co_s on co_s.id = statuses1.collection_order_status_id
+            where rw = 1
+               )COA
+            
+               JOIN (SELECT DISTINCT run_sheet_id FROM PUBLIC.SALES_ORDER_STATUS_ACTIVITIES) SOA ON SOA.run_sheet_id = COA.run_sheet_id
+             
+          ) CH ON CH.COLLECTION_ORDER_ID = CRD.OPS_ID  AND CH.COLLECTION_DATE1 = CRD.COLLECTION_DATE
+WHERE COLLECTION_DATE BETWEEN '2023-04-04'::date AND current_Date
+AND (CH.run_sheet_id =  O2.run_sheet_id OR CRD.CREATED_AT < O2.updated_at)
+)F1
+
+-------------------------------------------time filter--------------------------------------------------------------------------
+
+where case when collection_date between '2023-04-04'::date and '2023-04-11'::date then warehouse in ('Mostorod','Barageel') 
+           when collection_date = '2023-04-12'::date then warehouse in ('Mostorod','Barageel','El-Wahat')
+           when collection_date > '2023-04-12'::date AND collection_date < '2023-04-16'::date  then warehouse in ('Mostorod','Barageel','El-Wahat','Barageel 2PL','Saryaqus Frozen 2 pl','Fisal frozen 2pl','Basous')
+           WHEN collection_date > '2023-04-15'::date AND collection_date < '2023-05-23'::date then warehouse in ('Mostorod','Barageel','El-Wahat','Barageel 2PL','Saryaqus Frozen 2 pl','Fisal frozen 2pl','Basous','El-Marg','Basatin')
+           WHEN collection_date > '2023-05-22'::date AND collection_date < '2023-05-28'::date then warehouse in ('Mostorod','Barageel','El-Wahat','Barageel 2PL','Saryaqus Frozen 2 pl','Fisal frozen 2pl','Basous','El-Marg','Basatin','Tanta','Mansoura','El-Mahala','Tanta DC','Qwesna','Mansoura FC')
+           WHEN collection_date > '2023-05-27'::date  then warehouse in ('Mostorod','Barageel','El-Wahat','Barageel 2PL','Saryaqus Frozen 2 pl','Fisal frozen 2pl','Basous','El-Marg','Basatin','Tanta','Mansoura','El-Mahala','Tanta DC','Qwesna','Mansoura FC','Sharqya')
+           end
+           
+           
+-------------------------------------------------------------------------------------------------------------------
+)fic
+WHERE CASE WHEN ASSIGNED_ORDER = 'YES' then ASSIGNED_ORDER = 'YES' 
+and sales_rn = ECOM_RUNSHEET else rc = 1 end 
+)
+WHERE RR1 = 1 
+
+),
+
+---------------------------------------------------------------------------------------------------------------------------------------------
+final1 as (select F.*,
+split_part(prs.day_q , ',', 1) as H_1,
+split_part(prs.day_q , ',', 2) as H_2,
+split_part(deferred_overnight_slots.intervals , ',', 1) as H_3,
+split_part(deferred_overnight_slots.intervals , ',', 2) as H_4,
+prt.hour as H_5,
+ROW_NUMBER() OVER(partition BY ops_id,F.COLLECTION_UPDATED_AT_FIRST_ACTION ORDER BY F.updated_at) AS RW
+
+from final F
+LEFT JOIN EMONEY.RETAILERS R ON R.main_system_id = F.RETAILER_ID
+left join (select right(Mobile,11) as mobile_1, hour::time as hour from fintech.preferred_collection_time) as prt on R.mobile = prt.mobile_1
+left join fintech.retailers_preferred_time_slot prs on f.retailer_id = prs.reatiler_id
+left join fintech.deferred_overnight_slots on f.ops_id = deferred_overnight_slots.collection_order_id
+WHERE case when f.COLLECTION_DATE < '2023-06-09' then DAYNAME(f.COLLECTION_DATE) <> 'Fri' else true end),
+
+-------------------------------------------------------------------------------------------------------------------------------------
+sla as (select *,
+case 
+  when type = 'Collection_order' and CASHIN_MODE = 'DEFERRED' AND order_time = 'overnight' then coalesce(extract(hour from prf),11)
+  when type = 'Collection_order' and CASHIN_MODE = 'DEFERRED' AND order_time = 'same day' then extract(hour from CREATED_AT)
+  when type = 'Collection_order' and CASHIN_MODE = 'INSTANT' AND order_time = 'overnight' then 13
+  when type = 'Collection_order' and CASHIN_MODE = 'INSTANT' AND order_time = 'same day' then extract(hour from CREATED_AT) + 2
+END AS PREFERRED_TIME
+    
+from
+(select *,
+case when H_5::time is not null then H_5::time when H_5::time is null and H_3::time is not null then H_3::time else H_1::time end as prf 
+from final1
+WHERE RW = 1 
+) v1),
+
+----------------------------------------------------------------------------------------------------------------------------------------
+SUMMARY AS (
+
+select v1.* ,dr.name courier
+from
+(select *,
+case 
+   when collection_date < '2023-04-21'::DATE THEN sla1
+   WHEN collection_date > '2023-04-20'::DATE AND  type = 'Collection_order' and ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS IN ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') AND (extract(hour from ECOMMERCE_UPDATED) between PREFERRED_TIME and PREFERRED_TIME + 2) then 'YES'
+   when collection_date > '2023-04-20'::DATE AND type = 'Credit' then 'YES'
+   WHEN collection_date > '2023-04-20'::DATE AND ASSIGNED_ORDER = 'YES' THEN 'NO'
+   end as  chk,
+ ROW_NUMBER() over(partition by collection_date,ops_id order by COLLECTION_UPDATED_AT_FIRST_ACTION) as rownum
+from sla )v1
+left join run_sheets rn on rn.id = v1.ECOM_RUNSHEET
+left join drivers dr on dr.id = rn.driver_id
+where rownum = 1 
+),
+--------------------------------------------------DAY ORDERS -----------------------------------------------------------------------------------
+COLLECTION_ORDERS AS(
+select 
+collection_date,
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' THEN 1 END) INSTANT_ORDERS,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' THEN 1 END) DEFERRED_ORDERS,
+
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND order_time = 'same day' THEN 1 END) INSTANT_ORDERS_SAMEDAY,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND order_time = 'same day' THEN 1 END) DEFERRED_ORDERS_SAMEDAY,
+
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND order_time = 'overnight' THEN 1 END) INSTANT_ORDERS_OVERNIGHT,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND order_time = 'overnight' THEN 1 END) DEFERRED_ORDERS_OVERNIGHT,
+
+sum(case when  type_id = 2 then 1 end) n_orders,
+sum(case when order_time = 'same day' and type_id = 2 then 1 end) same_day_orders,
+sum(case when order_time = 'overnight' and type_id = 2 then 1 end) overnight_orders,
+
+sum(case when  type_id = 1 then 1 end) n_orders_credit,
+sum(case when order_time = 'same day' and type_id = 1 then 1 end) same_day_credit_orders,
+sum(case when order_time = 'overnight' and type_id = 1 then 1 end) overnight_credit_orders,
+
+count(collection_order_id) all_day_orders,
+sum(case when order_time = 'same day'  then 1 end) same_day_all_orders,
+sum(case when order_time = 'overnight' then 1 end) overnight_all_orders
+
+from
+(SELECT 
+COLLECTION_DATE,
+COLLECTION_ORDER_ID,
+tag,
+region_id,
+order_time,
+type_id,
+CASHIN_MODE,
+ case 
+    when collections.collection_order_status_id = 2 or editor_id = 119 or (collections.collection_order_status_id = 3 and collections.COLLECTION_ORDER_SUB_STATUS_ID is null and collections.EDITOR_TYPE = 'admin') 
+    or (collections.collection_order_status_id = 3 and collections.COLLECTION_ORDER_SUB_STATUS_ID = 3 and  collections.delayed_to is null ) then 'ASSIGNED'
+    when collections.collection_order_status_id = 3 and collections.COLLECTION_ORDER_SUB_STATUS_ID is null and collections.EDITOR_TYPE = 'agent' and delayed_to is null then 'TRIP STARTED'
+    WHEN collections.collection_order_status_id = 3 and collections.COLLECTION_ORDER_SUB_STATUS_ID = 1 and delayed_to is null THEN 'TASK STARTED'
+    WHEN collections.collection_order_status_id = 3 and collections.run_sheet_id = collections.run_sheet_id and collections.COLLECTION_ORDER_SUB_STATUS_ID = 2 THEN 'ARRIVED'
+    when collections.collection_order_status_id = 3 and collections.delayed_to = 'same day' then 'DELAYED SAME DAY'
+    ELSE co_s.name_en END status,
+rw
+
+FROM (
+select *,
+case when created_at1::time between '10:30 AM' and '09:00 PM' and created_at1::date = collection_date then 
+'same day' else 'overnight' end as order_time,
+ROW_NUMBER() over(partition by collection_date,collection_order_id order by status_changed_at desc) rw
+from
+(SELECT COA.*,ci.tag,reg.id region_id,co.type_ID,
+
+CASE WHEN  ARRAY_CONTAINS('INSTANT'::variant,ci.cash_in_mode) THEN 'INSTANT' 
+WHEN NOT ARRAY_CONTAINS('INSTANT'::variant,ci.cash_in_mode) AND ci.cash_in_mode IS NOT NULL THEN  'DEFERRED' END AS CASHIN_MODE,
+
+case when 
+        status_changed_at between status_changed_at::date and status_changed_at::date +interval '4 hour'
+        then (status_changed_at::date - interval '1 day' )::date
+        else status_changed_at::date end ::date as collection_date,
+co.created_at as created_At1
+
+FROM  PUBLIC.COLLECTION_ORDER_STATUS_ACTIVITIES COA
+LEFT JOIN PUBLIC.COLLECTION_ORDERS CO ON CO.ID = COA.COLLECTION_ORDER_ID
+left join fintech.fintech_retailer_polygon mrp on mrp.retailer_id = co.retailer_id
+left join (SELECT collection_order_id,max(final_cash_in_date)final_cash_in_date, arrayagg(cash_in_mode) as cash_in_mode,arrayagg(tag_english)as tag FROM emoney.cash_ins 
+WHERE collection_order_id IS NOT NULL 
+and tag_english in ('Cash-In request','Cash-In request tsales','Default_order','Cash-in Request')
+group by 1
+order by 1) ci on ci.collection_order_id = co.MAXAB_COLLECTION_ORDER_ID
+LEFT JOIN PUBLIC.DISTRICTS d ON mrp.district_id = d.id
+LEFT JOIN PUBLIC.CITIES cit ON d.city_id =cit.id
+LEFT JOIN PUBLIC.STATES STAT ON cit.state_id=stat.id
+LEFT JOIN PUBLIC.REGIONS reg ON reg.id=stat.region_id 
+
+WHERE CO.type_ID in(2) and (coa.collection_order_status_id in (4,5,6,9) or (coa.collection_order_status_id = 3 and delayed_to is not null))  
+)cv1
+where 
+(array_contains('Cash-In request'::variant,tag)
+or array_contains('Cash-In request tsales'::variant,tag)
+or array_contains('Default_order'::variant,tag)
+or array_contains('Cash-in Request'::variant,tag)
+or type_ID = 1
+)
+and collection_Date between current_date -20 and current_date -1 and region_id in (select id from public.regions where {{region}})
+
+)collections
+left join collection_order_statuses co_s on co_s.id = collections.collection_order_status_id
+where collections.rw = 1 
+)vv1
+group by 1
+order by 1),
+----------------------------------------------------------------------------------------------------------------------------------------
+------------------------------------------------------------------------------------------------------------------------------------------
+/*SM1 AS (SELECT 
+collection_date,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'same day' then 1 end) deferred_same_day,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'overnight' then 1 end) deferred_overnight,
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'overnight' then 1 end) instant_overnight,
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'same day' then 1 end) instant_same_day,
+
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'same day' then 1 end)*1.00/3660*1.00 "deferred_same_day%",
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'overnight' then 1 end)*1.00/3660*1.00 "deferred_overnight%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'overnight' then 1 end)*1.00/3660*1.00 "instant_overnight%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'same day' then 1 end)*1.00/3660*1.00 "instant_same_day%",
+
+
+
+
+sum(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'same day' and chk = 'YES' then 1 end) deferred_same_day_within_sla ,
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'overnight' and chk = 'YES' then 1 end) deferred_overnight_within_sla,
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'overnight' and chk = 'YES' then 1 end) instant_overnight_within_sla,
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'same day' and chk = 'YES' then 1 end) instant_same_day_within_sla,
+
+sum(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'same day' and chk = 'YES' then 1 end)*1.00/3660*1.00 AS "deferred_same_day_within_sla%",
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'overnight' and chk = 'YES' then 1 end)*1.00/3660*1.00 AS "deferred_overnight_within_sla%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'overnight' and chk = 'YES' then 1 end)*1.00/3660*1.00 AS "instant_overnight_within_sla%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'same day' and chk = 'YES' then 1 end)*1.00/3660*1.00 AS "instant_same_day_within_sla%",
+
+
+sum(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'same day' and chk = 'NO' then 1 end)*1.00/3660*1.00 AS "deferred_same_day_OUT_OF_SLA%",
+SUM(CASE WHEN CASHIN_MODE = 'DEFERRED' AND ORDER_TIME = 'overnight' and chk = 'NO' then 1 end)*1.00/3660*1.00 AS "deferred_overnight_OUT_OF_SLA%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'overnight' and chk = 'NO' then 1 end)*1.00/3660*1.00 AS "instant_overnight_within_OUT_OF_SLA%",
+SUM(CASE WHEN CASHIN_MODE = 'INSTANT' AND ORDER_TIME = 'same day' and chk = 'NO' then 1 end)*1.00/3660*1.00 AS "instant_same_day_within_OUT_OF_SLA%",
+
+sum(case when type = 'Credit' then 1 end)*1.00/3660*1.00 as credit_orders 
+
+from summary
+group by 1
+ORDER BY 1),
+
+
+FSM AS (SELECT *,
+"deferred_same_day%" + "deferred_overnight%" + "instant_overnight%" + "instant_same_day%" AS TOTAL_PR,
+"deferred_same_day_within_sla%" + "deferred_overnight_within_sla%" + "instant_overnight_within_sla%" + "instant_same_day_within_sla%" as total_within_sla
+FROM SM1),
+
+sm3 as (select 
+warehouse,
+round(avg(n_orders_overnight)) avg_orders_overnight,
+round(avg(n_orders_same_day)) avg_orders_same_day 
+
+from
+(SELECT 
+collection_date,
+warehouse,
+SUM(CASE WHEN ORDER_TIME = 'overnight' then 1 else 0 end) n_orders_overnight,
+sum(CASE WHEN ORDER_TIME = 'same day' then 1 else 0 end) n_orders_same_day
+
+
+FROM FINAL
+group by 1,2
+order by 1)b1
+group by 1),
+*/
+---------------------------------------------------------------------------------------------
+sm as (
+
+
+SELECT COLLECTION_DATE,
+--warehouse,
+COUNT(OPS_ID) TOTAL_ORDERS_AVAILABLE,
+SUM(CASE WHEN ORDER_TIME = 'same day'  THEN 1 ELSE 0 END ) AS samday_ORDERS,
+SUM(CASE WHEN ORDER_TIME = 'overnight'  THEN 1 ELSE 0 END ) AS overnight_ORDERS,
+
+SUM(CASE WHEN TYPE = 'Collection_order' AND CASHIN_MODE = 'INSTANT' THEN 1 END) INSTANT_ORDERS,
+SUM(CASE WHEN TYPE = 'Collection_order' AND CASHIN_MODE = 'DEFERRED' THEN 1 END) DEFERRED_ORDERS,
+
+
+sum(case when type = 'Collection_order' then 1 else 0 end) as collection_orders,
+sum(case when ORDER_TIME = 'same day' and type = 'Collection_order' then 1 else 0 end) as collection_sameday_orders,
+sum(case when ORDER_TIME = 'overnight' and type = 'Collection_order' then 1 else 0 end) as collection_overnight_orders,
+
+
+sum(case when type = 'Credit' then 1 else 0 end) as credit_orders,
+sum(case when ORDER_TIME = 'same day' and type = 'Credit' then 1 else 0 end) as credit_sameday_orders,
+sum(case when ORDER_TIME = 'overnight' and type = 'Credit' then 1 else 0 end) as credit_overnight_orders
+
+
+
+-- SUM(CASE WHEN TYPE = 'Collection_order'  THEN 1 ELSE 0 END ) AS N_COLLECTION_ORDERS,
+-- SUM(CASE WHEN TYPE = 'Credit'  THEN 1 ELSE 0 END ) AS N_Credit_ORDERS,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'YES' then 1 end) ASSIGNED_ORDERS,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' then 1 end) ASSIGNED_ORDERS_VALID,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'NOT VALID' then 1 end) ASSIGNED_ORDERS_IN_VALID,
+-- sum(case when ECOMMERCE_STATUS IN ('COLLECTED','PARTIALLY_COLLECTED','FAILED') and assigned_order = 'YES' then 1 end) closed_orders,
+-- sum(case when ECOMMERCE_STATUS IN ('COLLECTED','PARTIALLY_COLLECTED','FAILED','DELAYED SAME DAY','DELAYED') and assigned_order = 'YES' then 1 end)*1.00/SUM(CASE WHEN ASSIGNED_ORDER = 'YES' then 1 end) CLOSED_orders2,
+-- SUM(CASE WHEN ORDER_TIME = 'same day' AND (ASSIGNED_ORDER = 'YES' )   then 1 end) SAMEDAY_ASSIGNED,
+-- SUM(CASE WHEN ORDER_TIME = 'overnight' AND (ASSIGNED_ORDER = 'YES' )   then 1 end) OVERNIGHT_ASSIGNED,
+-- SUM(CASE WHEN (ECOMMERCE_STATUS NOT IN ('COLLECTED','PARTIALLY_COLLECTED','FAILED') OR ECOMMERCE_STATUS IS NULL)  AND ASSIGNED_ORDER = 'YES' THEN 1 END ) REASSIGNED_ORDERS,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'NO' and VALIDATION = 'VALID' then 1 end) failed_orders_to_assigned_valid,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'NO' and VALIDATION = 'NOT VALID' then 1 end) failed_orders_to_assigned_not_valid,
+-- --SUM(CASE WHEN ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') then 1 else 0 end)*1.00 / SUM(CASE WHEN ASSIGNED_ORDER = 'YES' OR (ASSIGNED_ORDER = 'NO' and VALIDATION = 'NOT VALID')   then 1 end)*1.00 sr,
+-- SUM(CASE WHEN ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') then 1 else 0 end)*1.00 / SUM(CASE WHEN ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID'   then 1 end)*1.00 sr_assigned,
+-- SUM(CASE WHEN ORDER_TIME = 'same day' AND ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') and VALIDATION_ASSIGN = 'VALID' then 1 else 0  end)*1.00 / SUM(CASE WHEN ORDER_TIME = 'same day' AND (ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID'  )   then 1 end)*1.00 sr_ASSIGNED_SAMEDAY,
+-- SUM(CASE WHEN ORDER_TIME = 'overnight' AND ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') and VALIDATION_ASSIGN = 'VALID' then 1 else 0 end)*1.00 / SUM(CASE WHEN ORDER_TIME = 'overnight' AND (ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' )   then 1 end)*1.00 sr_ASSIGNED_OVERNIGHT,
+-- SUM(CASE WHEN TYPE = 'Collection_order' and ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') and VALIDATION_ASSIGN = 'VALID' then 1 else 0 end)*1.00 / SUM(CASE WHEN TYPE = 'Collection_order' and (ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' )  then 1 end)*1.00 sr_ASSIGNED_collection,
+-- SUM(CASE WHEN TYPE = 'Credit' and ASSIGNED_ORDER = 'YES' AND ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') and VALIDATION_ASSIGN = 'VALID' then 1 else 0 end)*1.00 / SUM(CASE WHEN TYPE = 'Credit' and (ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' ) then 1 end)*1.00 sr_ASSIGNED_credit,
+
+-- SUM(CASE WHEN ECOMMERCE_STATUS NOT IN ('COLLECTED','PARTIALLY_COLLECTED','FAILED') AND ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' AND LAST_STATUS IN ('COLLECTED','PARTIALLY_COLLECTED') THEN 1 END)*1.00 / SUM(CASE WHEN ECOMMERCE_STATUS NOT IN ('COLLECTED','PARTIALLY_COLLECTED','FAILED') AND ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' THEN 1 END )*1.00  SR_REASSIGNED_ORDERS,
+-- sum(case when ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' and TYPE = 'Collection_order' and CHK = 'YES' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 / sum(case when TYPE = 'Collection_order'  AND (ASSIGNED_ORDER = 'YES' ) and VALIDATION_ASSIGN = 'VALID' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 AS assigned_COLLECTION_WITHIN_SLA,
+-- sum(case when ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' and TYPE = 'Collection_order' and CHK = 'NO' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 / sum(case when  TYPE = 'Collection_order'  AND (ASSIGNED_ORDER = 'YES' ) and VALIDATION_ASSIGN = 'VALID' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 AS assigned_COLLECTION_OUT_OF_SLA,
+-- sum(case when ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' and TYPE = 'Collection_order' and CHK = 'YES' and ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') THEN 1 else 0 END )*1.00 / sum(case when TYPE = 'Collection_order' AND CHK = 'YES' AND (ASSIGNED_ORDER = 'YES') and VALIDATION_ASSIGN = 'VALID' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 AS sr_assigned_COLLECTION_WITHIN_SLA,
+-- sum(case when ASSIGNED_ORDER = 'YES' and VALIDATION_ASSIGN = 'VALID' and TYPE = 'Collection_order' and CHK = 'NO' and ECOMMERCE_STATUS in ('COLLECTED','PARTIALLY_COLLECTED') THEN 1 else 0 END )*1.00 / sum(case when  TYPE = 'Collection_order' and CHK = 'NO' AND (ASSIGNED_ORDER = 'YES') and VALIDATION_ASSIGN = 'VALID' and ECOMMERCE_STATUS in ('COLLECTED','FAILED','DELAYED','PARTIALLY_COLLECTED','DELAYED SAME DAY') THEN 1 END )*1.00 AS sr_assigned_COLLECTION_out_of_SLA
+
+FROM SUMMARY
+WHERE case when COLLECTION_DATE < '2023-06-09' then DAYNAME(COLLECTION_DATE) <> 'Fri' else true end
+and collection_Date between current_date -20 and current_date -1
+and region_id in (select id from public.regions where {{region}})
+GROUP BY 1
+order by 1)
+----------------------------------------------------------------------------------------------------
+
+select sm.* 
+-- sm.collection_orders*1.00/co.n_orders "% of available collection orders",
+-- sm.collection_sameday_orders / co.same_day_ORDERS*1.00 "% of available collection orders same day",
+-- sm.collection_overnight_orders / co.overnight_orders*1.00 "% available collection orders overnight",
+
+-- sm.credit_orders*1.00/co.n_orders_credit "% of available credit orders",
+-- sm.credit_sameday_orders / co.same_day_credit_orders*1.00 "% of available credit orders same day",
+-- sm.credit_overnight_orders / co.overnight_credit_orders*1.00 "% available credit orders overnight",
+
+-- sm.TOTAL_ORDERS_AVAILABLE*1.00/co.all_day_orders "% of available all orders",
+-- sm.samday_ORDERS / co.same_day_all_orders*1.00 "% of available all orders same day",
+-- sm.overnight_ORDERS / co.overnight_all_orders*1.00 "% available all orders overnight"
+
+from Sm
+left join COLLECTION_ORDERS co on co.collection_Date = sm.collection_date
+order by sm.collection_date
